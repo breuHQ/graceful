@@ -7,80 +7,107 @@
 
 ## Motivation
 
-The `errgroup` package is excellent for coordinating goroutines and collecting errors, but it doesn't directly handle the critical aspect shutting down goroutines.
-This package, `graceful`, aims to handle graceful shutdown of shutdown of goroutines.
+`graceful` is a lightweight Go package for managing the graceful startup and shutdown of services with dependencies. It provides a simple and flexible API for handling the lifecycle of services in a structured and efficient manner.
 
-`graceful` aims to solve the following issues:
+### Why not use `uber/fx`?
 
-- **Asynchronous cleanup of channels:** Many applications involve channels for communication between goroutines.  Graceful shutdown often necessitates closing these channels to prevent further writes and allow existing readers to complete their tasks before the program exits.  This package provides a mechanism for closing channels and handling potential errors during this closing process.
-- **Handling initialization errors:** Concurrent goroutines might encounter errors during initialization, potentially halting the entire application.  `graceful` allows applications to catch and report these errors from various concurrently started goroutines.
-- **Timeout management:** Cleanup operations, like closing channels, could block indefinitely if the shutdown process isn't time-constrained.  This package includes a timeout mechanism that prevents indefinite blocking during shutdown, gracefully terminating the program if cleanup takes too long.
-- **Error aggregation:** `graceful` collects and reports errors encountered during initialization, cleanup tasks, and potentially during channel closure, providing comprehensive diagnostic information during shutdown.
-
-By providing a structured approach for handling channel closure and other cleanup operations, `graceful` promotes program stability, prevents resource leaks, and ensures data integrity during shutdown.
+While `uber/fx` is a powerful dependency injection framework for Go, we chose to create `graceful` because it offers a more focused and lightweight solution specifically for graceful shutdown. While `uber/fx` encompasses a wider range of functionalities including dependency injection and lifecycle management, `graceful` provides a streamlined API tailored to the needs of graceful shutdown. This narrower focus makes it easier to understand and integrate into projects, particularly for simpler use cases where the full scope of `uber/fx` might be unnecessary.
 
 ## API
 
-The graceful package provides two core functions for graceful shutdown management:
+The `graceful` package provides a mechanism for managing the lifecycle of services with dependencies. It ensures that services are started in the correct order and stopped in the reverse order, handling dependencies and errors gracefully.
 
-- `Go(ctx context.Context, fn func() error, errs chan error)`: This function launches fn in a new goroutine, forwarding any initialization errors to the errs channel. This is crucial for collecting errors from concurrently started goroutines.
-- `Shutdown(ctx context.Context, cleanups []Cleanup, interrupt chan os.Signal, timeout time.Duration, code int) int`: This function gracefully shuts down the application by first signaling all goroutines (interrupt) to perform their cleanup. It then waits for all cleanups in cleanups to complete within the given timeout. The return code reflects whether the shutdown was successful (0) or if it timed out/failed (non-zero).
+Here's a breakdown of the core components:
 
-The graceful package also provides a Cleanup type, which is a slice of functions that perform cleanup operations. This type is used to collect cleanup functions that need to be executed during shutdown.
+- **`Service` Interface:** Represents a service that can be started and stopped.
+- **`ServiceDef` Structure:** Defines a service with its dependencies.
+- **`Services` Map:** Stores a collection of service definitions.
+- **`Graceful` Structure:** Manages the lifecycle of a set of services, ensuring proper startup and shutdown order.
 
-Apart from these core functions, the graceful package also provides two utility functions:
+### Key Features
 
-- `GrabAndGo(fn func() error, args ...interface{}) func() error`: This function wraps fn to accept variadic arguments and returns a function that can be used with Go. This is useful for functions that require arguments.
-- `WrapRelease(fn func(chan any), interrupt chan any) func() error`: This function wraps fn to accept an interrupt channel and returns a function that can be used with Go. This is useful for functions that need to be interrupted during shutdown.
+- **Dependency Management:**  Ensures services start in the correct order based on their dependencies.
+- **Topological Sorting:**  Utilizes Kahn's algorithm to efficiently determine the service startup order.
+- **Concurrent Start/Stop:** Allows for parallel service initiation and termination for faster operation.
+- **Error Handling:**  Gracefully propagates errors encountered during service start/stop operations.
+- **GracefulError:** Provides a specialized error type to track service-specific failures.
 
 ## Getting Started
-
-To get started, install the package using the following command:
-
-```shell
-go get go.breu.io/graceful
-```
-
-Then, import the package in your code:
 
 ```go
 package main
 
 import (
 	"context"
-	"os"
-	"os/signal"
-	"slog"
+	"fmt"
+	"time"
 
-	"github.com/labstack/echo/v4"
 	"go.breu.io/graceful"
 )
 
+type (
+	// ExampleService implements the Service interface.
+	ExampleService struct {
+		name string
+	}
+)
+
+// Start starts the ExampleService.
+func (s *ExampleService) Start(ctx context.Context) error {
+	fmt.Printf("Starting service: %s\n", s.name)
+	// Perform service start logic here...
+	time.Sleep(1 * time.Second)
+	return nil
+}
+
+// Stop stops the ExampleService.
+func (s *ExampleService) Stop(ctx context.Context) error {
+	fmt.Printf("Stopping service: %s\n", s.name)
+	// Perform service stop logic here...
+	time.Sleep(1 * time.Second)
+	return nil
+}
+
 func main() {
 	ctx := context.Background()
-	web := echo.New()
-
-	errs := make(chan error)
-	interrupt := make(chan any)
 	terminate := make(chan os.Signal, 1)
+
 	signal.Notify(terminate, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, os.Interrupt)
 
-	graceful.Go(ctx, graceful.GrabAndGo(web.Start, "8000"), errs)
-	graceful.Go(ctx, graceful.WrapRelease(worker.Run, interrupt), errs)
 
-	cleanups := graceful.Cleanup{
-		web.Stop,
+	// Create a new Graceful manager.
+	g := graceful.New()
+
+	// Add services to the manager.
+	g.Add("service1", &ExampleService{name: "service1"})
+	g.Add("service2", &ExampleService{name: "service2"}, "service1")
+	g.Add("service3", &ExampleService{name: "service3"}, "service2")
+
+	// Start all services.
+	if err := g.Start(ctx); err != nil {
+		fmt.Printf("Error starting services: %v\n", err)
+		return
 	}
 
-	select {
-	err <- errs:
-		slog.Error("Error encountered during initialization: %v", err)
-	case <-terminate:
-		slog.Info("Received termination signal")
+	<- terminate
+
+	// Stop all services gracefully.
+	if err := g.Stop(ctx); err != nil {
+		fmt.Printf("Error stopping services: %v\n", err)
+		return
 	}
 
-	code := graceful.Shutdown(ctx, cleanups, interrupt, time.Second*10)
-
-	os.Exit(code)
+	fmt.Println("All services stopped gracefully.")
 }
+
 ```
+
+This code demonstrates how to use the `graceful` package to manage the lifecycle of three services with dependencies. The `service2` depends on `service1` and `service3` depends on `service2`, ensuring they are started in the correct order. The `graceful.Stop()` function handles the graceful shutdown process, stopping the services in the reverse order they were started.
+
+## Contributing
+
+Contributions to this project are welcome! If you have any issues or feature requests, please submit them through the GitHub issue tracker.
+
+## License
+
+This project is licensed under the MIT License.
