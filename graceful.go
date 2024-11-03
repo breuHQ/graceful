@@ -56,9 +56,9 @@ func (g *Graceful) sort() ([]string, error) {
 
 	// 2. Initialize a queue with nodes having in-degree 0 (no incoming edges)
 	queue := make([]string, 0)
-	for name := range g.svcs { // Iterate through all services in g.svcs
-		if _, ok := degree[name]; !ok { // Check if service exists in degree map
-			degree[name] = 0 // Initialize in-degree to 0 if it's missing
+	for name := range g.svcs {
+		if _, ok := degree[name]; !ok {
+			degree[name] = 0
 		}
 
 		if degree[name] == 0 {
@@ -68,7 +68,6 @@ func (g *Graceful) sort() ([]string, error) {
 
 	// 3. Initialize an empty slice to store the topological order
 	order := make([]string, 0)
-	seen := make(map[string]bool)
 
 	// 4. Perform Kahn's algorithm
 	for len(queue) > 0 {
@@ -77,10 +76,7 @@ func (g *Graceful) sort() ([]string, error) {
 		queue = queue[1:]
 
 		// 6. Add the node to the topological order
-		if !seen[name] {
-			order = append([]string{name}, order...)
-			seen[name] = true
-		}
+		order = append(order, name)
 
 		// 7. Update in-degree of neighbors (remove outgoing edge)
 		deps, ok := g.graph.Load(name)
@@ -94,12 +90,27 @@ func (g *Graceful) sort() ([]string, error) {
 		}
 
 		for _, dep := range list {
-			degree[dep]--
-			// 8. If in-degree of neighbor becomes 0, enqueue it
-			if degree[dep] == 0 {
-				queue = append(queue, dep)
+			// Check if dep is actually in the degree map
+			if _, ok := degree[dep]; ok {
+				degree[dep]--
+				// 8. If in-degree of neighbor becomes 0, enqueue it
+				if degree[dep] == 0 {
+					queue = append(queue, dep)
+				}
 			}
 		}
+	}
+
+	// 9. If there are still nodes with non-zero in-degree,
+	//    the graph has a cycle and is not a DAG
+	for _, zero := range degree {
+		if zero > 0 {
+			return nil, fmt.Errorf("Dependency graph has a cycle")
+		}
+	}
+
+	for i, j := 0, len(order)-1; i < j; i, j = i+1, j-1 {
+		order[i], order[j] = order[j], order[i]
 	}
 
 	return order, nil
@@ -118,8 +129,6 @@ func (g *Graceful) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	fmt.Println("sorted: ", sorted)
 
 	for _, name := range sorted {
 		svc, ok := g.svcs[name]
