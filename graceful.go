@@ -1,200 +1,300 @@
-// Crafted with ❤ at Breu, Inc. <info@breu.io>, Copyright © 2024.
+// Package graceful provides a mechanism for managing the lifecycle of services with dependencies.
 //
-// Functional Source License, Version 1.1, Apache 2.0 Future License
+// It ensures that services are started in the correct order and stopped in the reverse order,
+// handling dependencies and errors gracefully.
 //
-// We hereby irrevocably grant you an additional license to use the Software under the Apache License, Version 2.0 that
-// is effective on the second anniversary of the date we make the Software available. On or after that date, you may use
-// the Software under the Apache License, Version 2.0, in which case the following will apply:
-//
-// Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with
-// the License.
-//
-// You may obtain a copy of the License at
-//
-// http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on
-// an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
-// specific language governing permissions and limitations under the License.
-
-// Package graceful provides a robust mechanism for gracefully shutting down goroutines and handling potential errors
-// during their initialization. This ensures smooth program termination, guaranteeing all in-flight requests are
-// processed and ongoing tasks are completed before exit.
-//
-// The package offers two key functions, working in concert to achieve graceful shutdown:
-//
-//   - graceful.Go: Launches a goroutine and forwards any encountered initialization errors to the provided error
-//     channel.
-//   - graceful.Shutdown: Executes user-defined cleanup functions and manages the shutdown process. Optionally signals
-//     other programs to gracefully terminate and includes a timeout parameter to handle processes that might get stuck
-//     during shutdown, allowing for forceful termination if necessary.
-//
-// The package also provides two helper functions to make it easier to use graceful.Go with different types of
-// functions:
-//
-//   - GrabAndGo:  Creates a function that can be launched using graceful.Go, accepting a parameter. It simplifies
-//     starting functions that accept a single parameter.
-//   - WrapRelease: Creates a function that can be launched using graceful.Go, designed for programs like Temporal that
-//     utilize an interrupt channel for graceful shutdown.
-//
-// Example Usage:
+// # Example
 //
 //	import (
 //	  "context"
-//	  "os"
-//	  "os/signal"
-//	  "syscall"
+//	  "fmt"
 //	  "time"
-//
-//	  "github.com/labstack/echo/v4"
-//	  "go.breu.io/quantm/internal/graceful"
-//	  "go.breu.io/quantm/internal/shared"
+//	  "github.com/your/package/graceful"
 //	)
 //
-//	// Define cleanup functions
-//	func shutdownDatabase(ctx context.Context) error {
-//	  // ... perform database shutdown actions ...
+//	type ServiceA struct{}
+//
+//	func (a *ServiceA) Start(ctx context.Context) error {
+//	  fmt.Println("Service A starting...")
+//	  time.Sleep(1 * time.Second) // Simulate service startup
+//	  fmt.Println("Service A started.")
 //	  return nil
 //	}
 //
-//	func closeConnections(ctx context.Context) error {
-//	  // ... close network connections ...
+//	func (a *ServiceA) Stop(ctx context.Context) error {
+//	  fmt.Println("Service A stopping...")
+//	  time.Sleep(1 * time.Second) // Simulate service shutdown
+//	  fmt.Println("Service A stopped.")
+//	  return nil
+//	}
+//
+//	type ServiceB struct{}
+//
+//	func (b *ServiceB) Start(ctx context.Context) error {
+//	  fmt.Println("Service B starting...")
+//	  time.Sleep(1 * time.Second) // Simulate service startup
+//	  fmt.Println("Service B started.")
+//	  return nil
+//	}
+//
+//	func (b *ServiceB) Stop(ctx context.Context) error {
+//	  fmt.Println("Service B stopping...")
+//	  time.Sleep(1 * time.Second) // Simulate service shutdown
+//	  fmt.Println("Service B stopped.")
 //	  return nil
 //	}
 //
 //	func main() {
-//	  ctx, cancel := context.WithCancel(context.Background())
-//	  defer cancel()
+//	  mgr := graceful.New()
+//	  a := &ServiceA{}
+//	  b := &ServiceB{}
 //
-//	  errs := make(chan error)
-//	  interrupt := make(chan any)
+//	  mgr.Add("service-a", a)
+//	  mgr.Add("service-b", b, "service-a")
 //
-//	  // Handle termination signals (SIGINT, SIGTERM, SIGQUIT)
-//	  sigterm := make(chan os.Signal, 1)
-//	  signal.Notify(sigterm, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+//	  ctx := context.Background()
 //
-//	  // Start the Echo server:
-//	  graceful.Go(ctx, graceful.GrabAndGo(ctx, echo.New().Start, ":8080"), errs)
+//		quit := make(chan os.Signal, 1)
+//		signal.Notify(terminate, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT, os.Interrupt)
 //
-//	  // Run a Temporal worker:
-//	  graceful.Go(ctx, graceful.WrapRelease(ctx, worker.Run, interrupt), errs)
-//
-//	  // Wait for a signal or an error
-//	  select {
-//	  case <-sigterm:
-//	    slog.Info("shutdown signal received, gracefully shutting down all connections")
-//	  case err := <-errs:
-//	    if err != nil {
-//	      slog.Error("error received from goroutine", "error", err)
-//	    }
+//	  // Start all services in the correct order.
+//	  if err := mgr.Start(ctx); err != nil {
+//	    fmt.Println("Error starting services:", err)
+//	    return
 //	  }
 //
-//	  // Gracefully shutdown components
-//	  cleanups := []graceful.Cleanup{
-//	    shutdownDatabase,
-//	    closeConnections,
+//	  // Wait for a signal to stop services.
+//	  fmt.Println("Press Ctrl+C to stop services...")
+//	  <-quit
+//
+//	  // Stop all services gracefully.
+//	  if err := mgr.Stop(ctx); err != nil {
+//	    fmt.Println("Error stopping services:", err)
+//	    return
 //	  }
-//	  code := graceful.Shutdown(ctx, cleanups, errs, 10*time.Second, 0)
-//	  os.Exit(code)
+//
+//	  fmt.Println("Services stopped gracefully.")
 //	}
 package graceful
 
 import (
 	"context"
-	"log/slog"
+	"fmt"
 	"sync"
-	"time"
 )
 
 type (
-	// Cleanup represents a function that performs cleanup actions during a graceful shutdown.
-	Cleanup func(ctx context.Context) error
+	// Service is an interface representing a service that can be started and stopped.
+	Service interface {
+		// Start starts the service in the given context.
+		Start(ctx context.Context) error
+		// Stop stops the service in the given context.
+		Stop(ctx context.Context) error
+	}
 
-	// Parameterized represents a function that can be started, typically accepting a parameter.
-	Parameterized[T any] func(param T) error
+	// ServiceDef defines a service with its dependencies.
+	ServiceDef struct {
+		Service Service   // service implementation
+		Name    string    // service name
+		Deps    []string  // list of dependencies
+		once    sync.Once // Ensures Start is called only once for each service.
+	}
 
-	// Interruptable represents a function that can be gracefully interrupted.
-	Interruptable func(interrupt <-chan any) error
+	// Services is a map of service names to their definitions.
+	Services map[string]*ServiceDef
+
+	// Graceful manages the lifecycle of a set of services with dependencies.
+	// It ensures that services are started in the correct order and stopped in the reverse order.
+	Graceful struct {
+		svcs  Services   // Map of services.
+		graph sync.Map   // Dependency graph of services.
+		order []string   // Ordered list of service names.
+		cherr chan error // Channel for errors encountered during service lifecycle.
+	}
+
+	// GracefulError is an error that occurred during service lifecycle.
+	GracefulError struct {
+		Service string // Service name that failed
+		Reason  string // Reason for the error
+		Err     error  // Underlying error
+	}
 )
 
-// GrabAndGo simplifies the use of Go with functions that require an argument.
-func GrabAndGo[T any](fn Parameterized[T], arg T) func() error {
-	return func() error {
-		return fn(arg)
-	}
+// Error returns a formatted error string.
+func (e *GracefulError) Error() string {
+	return fmt.Sprintf("Error in service %s: %s: %v", e.Service, e.Reason, e.Err)
 }
 
-// WrapRelease simplifies the use of Go with functions that accept an interrupt channel for graceful shutdown.
-func WrapRelease(fn Interruptable, release <-chan any) func() error {
-	return func() error {
-		return fn(release)
-	}
+// NewGracefulError creates a new GracefulError.
+func NewGracefulError(service, reason string, err error) *GracefulError {
+	return &GracefulError{Service: service, Reason: reason, Err: err}
 }
 
-// Go runs a function in a goroutine and sends any errors to the quit channel.
+// sort calculates the topological order of the services based on their dependencies.
+// It implements [Kahn's algorithm] for topological sorting.
 //
-// This function is intended to be used in conjunction with Shutdown to handle errors from goroutines and ensure a
-// graceful shutdown.
-func Go(ctx context.Context, fn func() error, errs chan error) {
-	go func() {
-		if err := fn(); err != nil {
-			errs <- err
+//   - Time complexity: O(V+E), where V is the number of services and E is the number of dependencies.
+//   - Space complexity: O(V+E).
+//
+// [Kahn's algorithm]: https://www.geeksforgeeks.org/kahns-algorithm-vs-dfs-approach-a-comparative-analysis/
+func (g *Graceful) sort() ([]string, error) {
+	// Calculate in-degree for each node (number of incoming edges)
+	degree := make(map[string]int)
+	for _, cmp := range g.svcs {
+		for _, dep := range cmp.Deps {
+			degree[dep]++
 		}
-	}()
+	}
+
+	// Initialize a queue with nodes having in-degree 0 (no incoming edges)
+	queue := make([]string, 0)
+
+	for name := range g.svcs {
+		if _, ok := degree[name]; !ok {
+			degree[name] = 0
+		}
+
+		if degree[name] == 0 {
+			queue = append(queue, name)
+		}
+	}
+
+	// Initialize an empty slice to store the topological order
+	order := make([]string, 0)
+
+	// Perform Kahn's algorithm
+	for len(queue) > 0 {
+		// Dequeue a node
+		name := queue[0]
+		queue = queue[1:]
+
+		// Add the node to the topological order
+		order = append(order, name)
+
+		// Update in-degree of neighbors (remove outgoing edge)
+		deps, ok := g.graph.Load(name)
+		if !ok {
+			return nil, NewGracefulError(name, "dependency graph missing entry", nil)
+		}
+
+		list, ok := deps.([]string)
+		if !ok {
+			return nil, NewGracefulError(name, "invalid dependency type", nil)
+		}
+
+		for _, dep := range list {
+			// Check if dep is actually in the degree map
+			if _, ok := degree[dep]; ok {
+				degree[dep]--
+				// If in-degree of neighbor becomes 0, enqueue it
+				if degree[dep] == 0 {
+					queue = append(queue, dep)
+				}
+			}
+		}
+	}
+
+	// If there are still nodes with non-zero in-degree, the graph has a cycle and is not a DAG
+	for _, zero := range degree {
+		if zero > 0 {
+			return nil, NewGracefulError("", "dependency cycle detected", nil)
+		}
+	}
+
+	// Reverse the order to get the correct sequence for service startup
+	for i, j := 0, len(order)-1; i < j; i, j = i+1, j-1 {
+		order[i], order[j] = order[j], order[i]
+	}
+
+	return order, nil
 }
 
-// Shutdown handles the graceful shutdown process for the given components.
-//
-// The Shutdown function gracefully shuts down components by:
-//
-//  1. Sending a shutdown signal to the interrupt channel.
-//  2. Calling each shutdown handler in the cleanups slice in a separate goroutine.
-//  3. Waiting for all handlers to complete before exiting.
-//
-// This function is intended to be used in conjunction with the Go function to handle errors from goroutines and ensure
-// a graceful shutdown.
-func Shutdown(ctx context.Context, cleanups []Cleanup, interrupt chan any, timeout time.Duration, code int) int {
-	interrupt <- nil
+// Add adds a new service to the graceful manager.
+func (g *Graceful) Add(name string, svc Service, deps ...string) {
+	g.svcs[name] = &ServiceDef{Service: svc, Name: name, Deps: deps}
+	g.graph.Store(name, deps)
+}
 
-	var (
-		wg sync.WaitGroup
-		mu sync.Mutex
-	)
+// Start starts all registered services in the order defined by their dependencies.
+// It starts services concurrently and waits for all services to start successfully.
+func (g *Graceful) Start(ctx context.Context) error {
+	g.cherr = make(chan error)
+	started := make(map[string]bool)
 
-	wg.Add(len(cleanups))
+	sorted, err := g.sort()
+	if err != nil {
+		return err
+	}
 
-	for _, cleanup := range cleanups {
+	for _, name := range sorted {
+		svc, ok := g.svcs[name]
+		if !ok {
+			return NewGracefulError(name, "service not found", nil)
+		}
+
+		if svc == nil {
+			return NewGracefulError(name, "service is nil", nil)
+		}
+
+		svc.once.Do(func() {
+			for _, dep := range svc.Deps {
+				for {
+					_, ok := started[dep]
+					if ok {
+						break
+					}
+				}
+			}
+
+			go func() {
+				if err := svc.Service.Start(ctx); err != nil {
+					g.cherr <- NewGracefulError(name, "service start failed", err)
+				}
+			}()
+
+			g.order = append(g.order, name)
+			started[name] = true
+		})
+	}
+
+	return nil
+}
+
+// Stop stops all registered services in the reverse order they were started.
+// It stops services concurrently and waits for all services to stop gracefully.
+func (g *Graceful) Stop(ctx context.Context) error {
+	var wg sync.WaitGroup
+	// Use the reverse of the started order to stop services
+	for i := len(g.order) - 1; i >= 0; i-- {
+		name := g.order[i]
+
+		wg.Add(1)
+
 		go func() {
 			defer wg.Done()
 
-			if err := cleanup(ctx); err != nil {
-				mu.Lock()
-				defer mu.Unlock()
+			for _, cmp := range g.svcs {
+				if cmp.Name == name {
+					if err := cmp.Service.Stop(ctx); err != nil {
+						g.cherr <- NewGracefulError(name, "service stop failed", err)
+					}
 
-				slog.Warn("graceful: cleanup failed", "error", err)
-
-				code = 1
+					return
+				}
 			}
 		}()
 	}
-
-	done := make(chan bool)
-	go func() {
-		wg.Wait()
-		done <- true
-	}()
+	wg.Wait()
 
 	select {
-	case <-done:
-		// All cleanups completed within the timeout.
-	case <-time.After(timeout):
-		mu.Lock()
-		defer mu.Unlock()
-
-		slog.Warn("graceful: shutdown timeout reached, some cleanups may not have completed")
-
-		code = 1
+	case err := <-g.cherr:
+		return err
+	default:
+		return nil
 	}
+}
 
-	return code
+// New creates a new Graceful manager.
+func New() *Graceful {
+	return &Graceful{svcs: make(Services)}
 }
