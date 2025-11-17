@@ -106,10 +106,9 @@ type (
 	// Graceful manages the lifecycle of a set of services with dependencies.
 	// It ensures that services are started in the correct order and stopped in the reverse order.
 	Graceful struct {
-		svcs  Services   // Map of services.
-		graph sync.Map   // Dependency graph of services.
-		order []string   // Ordered list of service names.
-		cherr chan error // Channel for errors encountered during service lifecycle.
+		svcs  Services // Map of services.
+		graph sync.Map // Dependency graph of services.
+		order []string // Ordered list of service names.
 	}
 
 	// GracefulError is an error that occurred during service lifecycle.
@@ -201,7 +200,6 @@ func (g *Graceful) sort() ([]string, error) {
 		}
 	}
 
-	// Reverse the order to get the correct sequence for service startup
 	for i, j := 0, len(order)-1; i < j; i, j = i+1, j-1 {
 		order[i], order[j] = order[j], order[i]
 	}
@@ -216,16 +214,27 @@ func (g *Graceful) Add(name string, svc Service, deps ...string) {
 }
 
 // Start starts all registered services in the order defined by their dependencies.
+//
 // It starts services concurrently and waits for all services to start successfully.
 func (g *Graceful) Start(ctx context.Context) error {
-	g.cherr = make(chan error)
-	started := make(map[string]bool)
-
 	sorted, err := g.sort()
 	if err != nil {
 		return err
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	wg := sync.WaitGroup{}
+	chanerr := make(chan error, 1)
+	ready := make(map[string]chan struct{})
+
+	// creating ready signals against each service.
+	for svc := range g.svcs {
+		ready[svc] = make(chan struct{})
+	}
+
+	// start each service when all dependencies are ready.
 	for _, name := range sorted {
 		svc, ok := g.svcs[name]
 		if !ok {
@@ -236,62 +245,75 @@ func (g *Graceful) Start(ctx context.Context) error {
 			return NewGracefulError(name, "service is nil", nil)
 		}
 
-		svc.once.Do(func() {
-			for _, dep := range svc.Deps {
-				for {
-					_, ok := started[dep]
-					if ok {
-						break
-					}
-				}
-			}
-
-			go func() {
-				if err := svc.Service.Start(ctx); err != nil {
-					g.cherr <- NewGracefulError(name, "service start failed", err)
-				}
-			}()
-
-			g.order = append(g.order, name)
-			started[name] = true
-		})
-	}
-
-	return nil
-}
-
-// Stop stops all registered services in the reverse order they were started.
-// It stops services concurrently and waits for all services to stop gracefully.
-func (g *Graceful) Stop(ctx context.Context) error {
-	var wg sync.WaitGroup
-	// Use the reverse of the started order to stop services
-	for i := len(g.order) - 1; i >= 0; i-- {
-		name := g.order[i]
-
 		wg.Add(1)
 
-		go func() {
+		go func(def *ServiceDef) {
 			defer wg.Done()
 
-			for _, cmp := range g.svcs {
-				if cmp.Name == name {
-					if err := cmp.Service.Stop(ctx); err != nil {
-						g.cherr <- NewGracefulError(name, "service stop failed", err)
-					}
-
+			// wait for all dependencies to be ready
+			for _, dep := range def.Deps {
+				select {
+				case <-ready[dep]: // continue when dependency is ready.
+				case <-ctx.Done(): // return when dependency has failed elsewhere.
 					return
 				}
 			}
-		}()
-	}
-	wg.Wait()
 
-	select {
-	case err := <-g.cherr:
-		return err
-	default:
-		return nil
+			// start the service
+			svc.once.Do(func() {
+				if err := def.Service.Start(ctx); err != nil {
+					select {
+					case chanerr <- err:
+					default:
+					}
+
+					cancel()
+
+					return
+				}
+
+				close(ready[def.Name])
+			})
+		}(svc)
 	}
+
+	// asynchorously wait till all services are ready.
+	go func() {
+		wg.Wait()
+		close(chanerr)
+	}()
+
+	g.order = sorted
+
+	// returns error or nil (when channel is closed)
+	return <-chanerr
+}
+
+// Stop stops all registered services in the reverse order they were started.
+//
+// It stops services concurrently and waits for all services to stop gracefully.
+// Stop stops all running services in the reverse order they were started.
+func (g *Graceful) Stop(ctx context.Context) error {
+	chanerr := make(chan error, len(g.order))
+	wg := sync.WaitGroup{}
+
+	// Iterate backwards over the start order for correct shutdown.
+	for i := len(g.order) - 1; i >= 0; i-- {
+		name := g.order[i]
+		svc := g.svcs[name]
+		wg.Add(1)
+		go func(s *ServiceDef) {
+			defer wg.Done()
+			if err := s.Service.Stop(ctx); err != nil {
+				chanerr <- NewGracefulError(s.Name, "stop failed", err)
+			}
+		}(svc)
+	}
+
+	wg.Wait()
+	close(chanerr)
+
+	return <-chanerr
 }
 
 // New creates a new Graceful manager.

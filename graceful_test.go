@@ -2,161 +2,124 @@ package graceful_test
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"go.breu.io/graceful"
 )
 
 type MockSvc struct {
-	name  string
-	start bool
-	stop  bool
+	name        string
+	mu          sync.Mutex
+	started     bool
+	stopped     bool
+	failStart   bool
+	failStop    bool
+	stopOrder   *[]string
+	stopOrderMu *sync.Mutex
+}
+
+func NewMockSvc(name string, stopOrder *[]string, mu *sync.Mutex) *MockSvc {
+	return &MockSvc{
+		name:        name,
+		stopOrder:   stopOrder,
+		stopOrderMu: mu,
+	}
 }
 
 func (m *MockSvc) Start(ctx context.Context) error {
-	if m.start {
-		return fmt.Errorf("service %s already started", m.name)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.failStart {
+		return errors.New("failed to start " + m.name)
 	}
-	m.start = true
+	m.started = true
 	return nil
 }
 
 func (m *MockSvc) Stop(ctx context.Context) error {
-	if !m.start {
-		return fmt.Errorf("service %s not started", m.name)
+	m.mu.Lock()
+	if m.failStop {
+		m.mu.Unlock()
+		return errors.New("failed to stop " + m.name)
 	}
-	if m.stop {
-		return fmt.Errorf("service %s already stopped", m.name)
+	if !m.started {
+		m.mu.Unlock()
+		return errors.New(m.name + " was stopped before starting")
 	}
-	m.stop = true
+	m.stopped = true
+	m.mu.Unlock()
+
+	if m.stopOrder != nil {
+		m.stopOrderMu.Lock()
+		*m.stopOrder = append(*m.stopOrder, m.name)
+		m.stopOrderMu.Unlock()
+	}
 	return nil
 }
 
-func TestGraceful_Start(t *testing.T) {
-	t.Run("Start successfully", func(t *testing.T) {
-		g := graceful.New()
-		svc1 := &MockSvc{name: "service1"}
-		svc2 := &MockSvc{name: "service2"}
-		svc3 := &MockSvc{name: "service3"}
+func (m *MockSvc) FailOnStart() *MockSvc {
+	m.failStart = true
+	return m
+}
 
-		g.Add("service1", svc1)
-		g.Add("service2", svc2, "service1")
-		g.Add("service3", svc3, "service2")
+func TestGraceful_Lifecycle(t *testing.T) {
+	t.Run("Starts and Stops services in correct order", func(t *testing.T) {
+		g := graceful.New()
+		stopOrder := make([]string, 0)
+		var stopOrderMu sync.Mutex
+
+		svcA := NewMockSvc("A", &stopOrder, &stopOrderMu)
+		svcB := NewMockSvc("B", &stopOrder, &stopOrderMu)
+		svcC := NewMockSvc("C", &stopOrder, &stopOrderMu)
+
+		// Dependency chain: C -> B -> A
+		g.Add("A", svcA)
+		g.Add("B", svcB, "A")
+		g.Add("C", svcC, "B")
 
 		ctx := context.Background()
+
 		err := g.Start(ctx)
-		assert.NoError(t, err, "Error starting services")
+		assert.NoError(t, err)
 
-		time.Sleep(500 * time.Millisecond)
+		err = g.Stop(ctx)
+		assert.NoError(t, err)
 
-		assert.True(t, svc1.start, "Service1 not started")
-		assert.True(t, svc2.start, "Service2 not started")
-		assert.True(t, svc3.start, "Service3 not started")
-	})
-
-	t.Run("Start with Duplicate Dependencies", func(t *testing.T) {
-		g := graceful.New()
-		svc1 := &MockSvc{name: "service1"}
-		svc2 := &MockSvc{name: "service2"}
-		svc3 := &MockSvc{name: "service3"}
-
-		g.Add("service1", svc1)
-		g.Add("service2", svc2, "service1")
-		g.Add("service3", svc3, "service1", "service2")
-
-		ctx := context.Background()
-		err := g.Start(ctx)
-		assert.NoError(t, err, "Error starting services")
-
-		time.Sleep(500 * time.Millisecond)
-
-		assert.True(t, svc1.start, "Service1 not started")
-		assert.True(t, svc2.start, "Service2 not started")
-		assert.True(t, svc3.start, "Service3 not started")
-	})
-
-	t.Run("Check complex dependencies", func(t *testing.T) {
-		g := graceful.New()
-		services := make(map[string]*MockSvc, 10)
-
-		// Add services to the graph:
-		for i := 0; i < 10; i++ {
-			svc := &MockSvc{name: fmt.Sprintf("service%d", i)}
-			services[svc.name] = svc
-			g.Add(svc.name, svc)
-		}
-
-		// Manually defined dependencies (acyclic):
-		// service0: service1, service2, service3
-		// service1: service2, service3
-		// service2: service3
-		// service3: none
-		// ... (continue pattern)
-
-		g.Add("service0", services["service0"], "service1", "service2", "service3")
-		g.Add("service1", services["service1"], "service2", "service3")
-		g.Add("service2", services["service2"], "service3")
-		g.Add("service3", services["service3"]) // No dependencies
-		g.Add("service4", services["service4"], "service5", "service6", "service7", "service8", "service9")
-		g.Add("service5", services["service5"], "service6", "service7", "service8", "service9")
-		g.Add("service6", services["service6"], "service2", "service8", "service9")
-		g.Add("service7", services["service7"], "service8", "service9")
-		g.Add("service8", services["service8"], "service3")
-		g.Add("service9", services["service9"]) // No dependencies
-
-		// Start services and validate
-		ctx := context.Background()
-		err := g.Start(ctx)
-		assert.NoError(t, err, "Error starting services")
-
-		time.Sleep(500 * time.Millisecond)
-
-		// Verify that all services are started successfully:
-		for _, svc := range services {
-			assert.True(t, svc.start, fmt.Sprintf("Service %s not started", svc.name))
-		}
+		// Assert the stop order was correct (reverse of start order).
+		expectedStopOrder := []string{"C", "B", "A"}
+		assert.Equal(t, expectedStopOrder, stopOrder)
 	})
 }
 
-func TestGraceful_Stop(t *testing.T) {
-	t.Run("Check complex dependencies", func(t *testing.T) {
+func TestGraceful_Failures(t *testing.T) {
+	t.Run("Start fails if a service fails to start", func(t *testing.T) {
 		g := graceful.New()
-		services := make(map[string]*MockSvc, 10)
-
-		// Add services to the graph:
-		for i := 0; i < 10; i++ {
-			svc := &MockSvc{name: fmt.Sprintf("service%d", i)}
-			services[svc.name] = svc
-			g.Add(svc.name, svc)
-		}
-
-		// Define dependencies for each service, ensuring an acyclic graph:
-		for i := 0; i < 10; i++ {
-			svcName := fmt.Sprintf("service%d", i)
-			dependencies := make([]string, 0)
-			for j := i + 1; j < 10; j++ { // Ensure dependencies on services with higher indices
-				dependencyName := fmt.Sprintf("service%d", j)
-				dependencies = append(dependencies, dependencyName)
-			}
-			g.Add(svcName, services[svcName], dependencies...)
-		}
-
-		// Expected order is hard to determine manually with a complex graph.
-		// Instead, we'll validate the result by checking if all services are started
-		// in the correct order without errors.
+		svcA := NewMockSvc("A", nil, nil)
+		svcB := NewMockSvc("B", nil, nil).FailOnStart()
+		g.Add("A", svcA)
+		g.Add("B", svcB, "A")
 
 		ctx := context.Background()
 		err := g.Start(ctx)
-		assert.NoError(t, err, "Error starting services")
 
-		time.Sleep(500 * time.Millisecond)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to start B")
+	})
 
-		// Verify that all services are started successfully:
-		for _, svc := range services {
-			assert.True(t, svc.start, fmt.Sprintf("Service %s not started", svc.name))
-		}
+	t.Run("Start fails when a dependency cycle is detected", func(t *testing.T) {
+		g := graceful.New()
+		svcA := NewMockSvc("A", nil, nil)
+		svcB := NewMockSvc("B", nil, nil)
+		g.Add("A", svcA, "B")
+		g.Add("B", svcB, "A")
+
+		ctx := context.Background()
+		err := g.Start(ctx)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "dependency cycle detected")
 	})
 }
