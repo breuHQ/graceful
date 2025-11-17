@@ -289,31 +289,18 @@ func (g *Graceful) Start(ctx context.Context) error {
 	return <-chanerr
 }
 
-// Stop stops all registered services in the reverse order they were started.
-//
-// It stops services concurrently and waits for all services to stop gracefully.
-// Stop stops all running services in the reverse order they were started.
+// Stop stops all registered services sequentially in the reverse order they were started.
 func (g *Graceful) Stop(ctx context.Context) error {
-	chanerr := make(chan error, len(g.order))
-	wg := sync.WaitGroup{}
-
 	// Iterate backwards over the start order for correct shutdown.
 	for i := len(g.order) - 1; i >= 0; i-- {
 		name := g.order[i]
 		svc := g.svcs[name]
-		wg.Add(1)
-		go func(s *ServiceDef) {
-			defer wg.Done()
-			if err := s.Service.Stop(ctx); err != nil {
-				chanerr <- NewGracefulError(s.Name, "stop failed", err)
-			}
-		}(svc)
+		if err := svc.Service.Stop(ctx); err != nil {
+			return NewGracefulError(svc.Name, "stop failed", err)
+		}
 	}
 
-	wg.Wait()
-	close(chanerr)
-
-	return <-chanerr
+	return nil
 }
 
 // New creates a new Graceful manager.
