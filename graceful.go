@@ -222,7 +222,9 @@ func (g *Graceful) Start(ctx context.Context) error {
 		return err
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
+	// startctx is used to coordinate the startctx process.
+	// It is canceled if any service fails to start, or when Start returns.
+	startctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	wg := sync.WaitGroup{}
@@ -254,13 +256,15 @@ func (g *Graceful) Start(ctx context.Context) error {
 			for _, dep := range def.Deps {
 				select {
 				case <-ready[dep]: // continue when dependency is ready.
-				case <-ctx.Done(): // return when dependency has failed elsewhere.
+				case <-startctx.Done(): // return when dependency has failed elsewhere.
 					return
 				}
 			}
 
 			// start the service
 			svc.once.Do(func() {
+				// Pass the original context to the service so it doesn't get canceled
+				// when Start returns.
 				if err := def.Service.Start(ctx); err != nil {
 					select {
 					case chanerr <- err:
@@ -272,7 +276,7 @@ func (g *Graceful) Start(ctx context.Context) error {
 					return
 				}
 
-				close(ready[def.Name])
+				close(ready[def.Name]) // closing this indicates service is ready.
 			})
 		}(svc)
 	}

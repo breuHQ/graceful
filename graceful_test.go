@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"go.breu.io/graceful"
@@ -122,4 +123,46 @@ func TestGraceful_Failures(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "dependency cycle detected")
 	})
+}
+
+type MonitorSvc struct {
+	ContextCanceled bool
+	Done            chan struct{}
+}
+
+func (s *MonitorSvc) Start(ctx context.Context) error {
+	s.Done = make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		s.ContextCanceled = true
+		close(s.Done)
+	}()
+	return nil
+}
+
+func (s *MonitorSvc) Stop(ctx context.Context) error {
+	return nil
+}
+
+func TestGraceful_ContextSurvival(t *testing.T) {
+	g := graceful.New()
+	svc := &MonitorSvc{}
+	g.Add("monitor", svc)
+
+	ctx := context.Background()
+	err := g.Start(ctx)
+	assert.NoError(t, err)
+
+	// Allow some time to see if the deferred cancel in Start (if it existed incorrectly) would trigger
+	// We need to wait a bit because the cancellation propagation is asynchronous relative to this main thread
+	// if it happens via a goroutine or defer cleanup.
+	// In the fixed version, it shouldn't happen.
+	select {
+	case <-svc.Done:
+		if svc.ContextCanceled {
+			t.Fatal("Context passed to Start was canceled after Start returned")
+		}
+	case <-time.After(100 * time.Millisecond):
+		// This is the expected path if context is NOT canceled
+	}
 }
